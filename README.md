@@ -1,0 +1,2 @@
+# FL-XGB-QuantumXAI-Adaptive-Federated-Learning-with-Explainability
+This repository contains the Python implementation for 'Explainable Air Quality Management.' It features federated learning with adaptive model aggregation, quantum-optimized hyperparameter tuning, SHAP-based explainability, and anomaly detection using PrefixSpan. The system enhances AQI prediction and interpretability across IoT sensor nodes.
