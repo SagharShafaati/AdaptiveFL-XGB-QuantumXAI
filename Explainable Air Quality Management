@@ -1,0 +1,224 @@
+import pandas as pd
+import numpy as np
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+from prefixspan import PrefixSpan
+import pennylane as qml
+import shap
+import matplotlib.pyplot as plt
+import os
+import seaborn as sns
+
+# Dataset Path
+dataset_path = "yourpath"
+result_path = "yourpath"
+
+# Load Dataset
+data = pd.read_excel(dataset_path)
+
+# Preprocessing: Convert date to datetime and sort by node/date
+data['date'] = pd.to_datetime(data['date'])
+data.sort_values(['node', 'date'], inplace=True)
+
+# Feature and Target Columns
+features = ['CO', 'O3', 'NO2', 'SO2', 'PM10', 'PM2.5', 'Highest tempreture: 12pm', 'Wind:km/h']
+target = 'AQI'
+
+# Split Data by Nodes (Federated Nodes)
+nodes = sorted(data['node'].unique(), key=lambda x: int(x.split(' ')[-1]))  # Sort nodes numerically
+federated_data = {node: data[data['node'] == node] for node in nodes}
+
+
+# Adaptive Federated Averaging
+def adaptive_federated_averaging(global_model, local_model, X_global, y_global, local_weight):
+    """
+    Adaptive aggregation: Assign higher weights to nodes with better performance.
+    """
+    # Generate predictions for the global dataset
+    global_preds = global_model.predict(X_global)
+    local_preds = local_model.predict(X_global)
+    
+    # Weighted average predictions
+    aggregated_preds = ((1 - local_weight) * global_preds + local_weight * local_preds)
+    
+    # Retrain the global model on the aggregated predictions
+    global_model.fit(X_global, aggregated_preds)
+    return global_model
+
+# Initialize Global Model and Results
+global_model = None
+evaluation_results = []
+
+# Accuracy Calculation
+def calculate_accuracy(y_true, y_pred):
+    """
+    Calculates accuracy as the percentage of predictions within a certain threshold of the true value.
+    """
+    threshold = 0.1 * np.mean(y_true)  # 10% of the mean value as a threshold
+    within_threshold = np.abs(y_true - y_pred) <= threshold
+    return np.sum(within_threshold) / len(y_true)
+
+# Split data into a global validation set for federated averaging
+X_global = data[features]
+y_global = data[target]
+
+for node, node_data in federated_data.items():
+    print(f"Training on node: {node}")
+    
+    # Train-Test Split
+    X = node_data[features]
+    y = node_data[target]
+    
+    # Handle missing values
+    if X.isnull().values.any() or y.isnull().values.any():
+        print(f"Missing values detected in node {node}. Filling missing values with the mean.")
+        X = X.fillna(X.mean())
+        y = y.fillna(y.mean())
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # ✅ Fix: Define hyperparameters manually
+    learning_rate = 0.1
+    max_depth = 6
+    
+    # Train Local XGBoost Model
+    model = XGBRegressor(learning_rate=learning_rate, max_depth=max_depth, random_state=42)
+    model.fit(X_train, y_train)
+    
+    # Evaluate
+    y_pred = model.predict(X_test)
+    
+    # Check if y_pred contains NaN values
+    if np.isnan(y_pred).any():
+        print(f"NaN values detected in predictions for node {node}. Skipping evaluation for this node.")
+        continue  # Skip this node if predictions are invalid
+    
+    # Calculate metrics
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    accuracy = calculate_accuracy(y_test, y_pred)
+    evaluation_results.append([node, mse, mae, r2, accuracy])
+    
+    # Adaptive Federated Averaging
+    local_weight = 1 / (1 + mse)  # Nodes with lower MSE get higher weights
+    if global_model is None:
+        global_model = model
+    else:
+        global_model = adaptive_federated_averaging(global_model, model, X_global, y_global, local_weight)
+
+# Anomaly Detection using PrefixSpan
+def detect_anomalies(data):
+    sequences = [list(row[features]) for _, row in data.iterrows()]
+    ps = PrefixSpan(sequences)
+    ps.minlen = 2
+    ps.maxlen = 5
+    return ps.topk(10, closed=True)
+
+# Collect anomaly results
+anomaly_results = []
+for node, node_data in federated_data.items():
+    patterns = detect_anomalies(node_data)
+    for pattern in patterns:
+        anomaly_results.append({'Node': node, 'Pattern': pattern[1], 'Frequency': pattern[0]})
+
+# Save Anomaly Detection Results
+anomaly_df = pd.DataFrame(anomaly_results)
+anomaly_df.to_excel(os.path.join(result_path, "anomaly_results.xlsx"), index=False)
+
+# Save Evaluation Results
+result_df = pd.DataFrame(evaluation_results, columns=['Node', 'MSE', 'MAE', 'R2', 'Accuracy'])
+result_df.to_excel(os.path.join(result_path, "evaluation_results.xlsx"), index=False)
+
+# SHAP Explainability
+explainer = shap.Explainer(global_model, X_global)
+shap_values = explainer(X_global)
+
+# Save SHAP Summary Plot
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values, X_global, show=False)
+plt.savefig(os.path.join(result_path, "SHAP_Summary_Plot.png"))
+plt.close()
+
+# Visualizations
+# 1. AQI Trends Across Nodes
+plt.figure(figsize=(20, 10))
+for node, node_data in federated_data.items():
+    plt.plot(node_data['date'], node_data['AQI'], label=f"Node {node}")
+plt.title("Air Quality Index (AQI) Across Nodes")
+plt.xlabel("Date")
+plt.ylabel("AQI")
+plt.legend()
+plt.savefig(os.path.join(result_path, "AQI_trends.png"))
+plt.close()
+
+# 2. Feature Importance
+plt.figure(figsize=(13, 6))
+shap.summary_plot(shap_values, X_global, plot_type="bar", show=False)
+plt.title("Feature Importance")
+plt.savefig(os.path.join(result_path, "Feature_Importance.png"))
+plt.close()
+
+# 3. Correlation Heatmap with Numbers and Custom Colors
+corr = data[features + [target]].corr()
+
+plt.figure(figsize=(12, 8))
+
+# Use seaborn heatmap for better customization
+sns.heatmap(
+    corr, 
+    annot=True,              # Add correlation numbers
+    fmt=".2f",               # Format numbers to two decimal places
+    cmap="Spectral",         # Custom colormap (green, pink, orange tones)
+    cbar=True,               # Include color bar
+    annot_kws={"size": 10},  # Annotation font size
+    square=True              # Keep cells square
+)
+
+plt.title("Correlation Heatmap", fontsize=12)
+plt.xticks(rotation=45, fontsize=8)
+plt.yticks(fontsize=8)
+plt.tight_layout()
+
+# Save the heatmap
+plt.savefig(os.path.join(result_path, "Correlation_Heatmap_Custom.png"))
+plt.close()
+
+
+# 4. Wind Speed vs AQI with Legend for Colors
+plt.figure(figsize=(8, 4))
+
+# Assign alternating colors
+colors = ['orange' if i % 2 == 0 else 'green' for i in range(len(data))]
+
+# Plot data
+plt.scatter(data['Wind:km/h'], data['AQI'], c=colors, alpha=0.7, label='Data Points')
+
+# Add legend to explain colors
+orange_patch = plt.Line2D([0], [0], color='orange', marker='o', linestyle='', label='Even Index')
+green_patch = plt.Line2D([0], [0], color='green', marker='o', linestyle='', label='Odd Index')
+plt.legend(handles=[orange_patch, green_patch])
+
+plt.title("Wind Speed vs AQI")
+plt.xlabel("Wind Speed (km/h)")
+plt.ylabel("AQI")
+plt.tight_layout()
+plt.savefig(os.path.join(result_path, "Wind_vs_AQI_Orange_Green_With_Legend.png"))
+plt.close()
+
+
+# 5. Top 5 Nodes with Highest AQI
+top_nodes = data.groupby('node')['AQI'].mean().sort_values(ascending=False).head(5).index
+plt.figure(figsize=(8, 4))
+for node in top_nodes:
+    node_data = federated_data[node]
+    plt.plot(node_data['date'], node_data['AQI'], label=f"Node {node}")
+plt.title("Top 5 Nodes with Highest AQI")
+plt.xlabel("Date")
+plt.ylabel("AQI")
+plt.legend()
+plt.savefig(os.path.join(result_path, "Top_5_Nodes_AQI.png"))
+plt.close()
+
+print("All results, SHAP analysis, and visualizations have been saved successfully.")
